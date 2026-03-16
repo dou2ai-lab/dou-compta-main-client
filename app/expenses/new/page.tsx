@@ -21,7 +21,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons'
 import { fileAPI, expensesAPI, reportAPI, adminAPI, getAuthErrorMessage } from '@/lib/api'
 import type { AdminCategory } from '@/lib/api'
-import type { ReceiptAPIResponse, ReceiptExtractionFromAPI, ReceiptOcrFromAPI } from '@/types/receipt'
+import type { ReceiptAPIResponse, ReceiptExtractionFromAPI, ReceiptOcrFromAPI, ReceiptExtractAPIResponse } from '@/types/receipt'
 
 type UploadState = 'empty' | 'processing' | 'success'
 
@@ -59,9 +59,21 @@ function toDateInputValue(value: string | number | null | undefined): string {
   return match ? match[1]! : s
 }
 
+/** Correct French decimal misparsed as integer (e.g. 13650 → 136.50, 3201 → 32.01). */
+function fixMisparsedAmount(value: unknown, isTotal: boolean): number | null {
+  if (value == null || Number.isNaN(Number(value))) return null
+  const n = Number(value)
+  if (n < 100) return n
+  if (Math.floor(n) !== n) return n // already has decimals
+  const candidate = Math.round((n / 100) * 100) / 100
+  if (isTotal && candidate >= 0.01 && candidate <= 999999.99) return candidate
+  if (!isTotal && candidate >= 0 && candidate <= 9999.99) return candidate
+  return n
+}
+
 /**
  * Merge extraction (primary) and ocr (fallback). Use extraction field when not null/undefined, else ocr, else default.
- * Ensures form gets all values even when extraction returns nulls.
+ * Applies fix for misparsed French decimals (13650 → 136.50).
  */
 function mergeExtractionToFormState(
   extraction: ReceiptExtractionFromAPI | null | undefined,
@@ -74,13 +86,29 @@ function mergeExtractionToFormState(
   const num = (v: unknown) =>
     v != null && !Number.isNaN(Number(v)) ? String(v) : ''
 
+  let totalAmount = e.total_amount ?? o.total_amount
+  const fixedTotal = fixMisparsedAmount(totalAmount, true)
+  if (fixedTotal != null && totalAmount != null && fixedTotal !== Number(totalAmount)) {
+    totalAmount = fixedTotal
+  }
+
+  let vatAmount = e.vat_amount ?? o.vat_amount
+  const vatRateVal = e.vat_rate ?? o.vat_rate
+  const fixedVat = fixMisparsedAmount(vatAmount, false)
+  if (fixedVat != null && vatAmount != null && fixedVat !== Number(vatAmount)) {
+    vatAmount = fixedVat
+  }
+  const vatNum = Number(vatAmount)
+  const rateCandidates = [5.5, 10, 20, 2.1, 8.5]
+  const likelyRate = vatNum > 0 && vatNum <= 100 && rateCandidates.includes(vatNum) && (vatRateVal == null || vatRateVal === '')
+
   const currencyVal = str(e.currency, str(o.currency, 'EUR'))
   return {
     merchant_name: str(e.merchant_name, str(o.merchant_name, '')),
     expense_date: toDateInputValue(e.expense_date ?? o.expense_date),
-    amount: num(e.total_amount ?? o.total_amount),
-    vat_amount: num(e.vat_amount ?? o.vat_amount),
-    vat_rate: num(e.vat_rate ?? o.vat_rate),
+    amount: totalAmount != null ? String(totalAmount) : '',
+    vat_amount: likelyRate ? '' : num(vatAmount),
+    vat_rate: num(likelyRate ? vatAmount : vatRateVal),
     category: str(e.category, str(o.category, '')),
     description: str(e.description, str(o.description, '')),
     currency: currencyVal || 'EUR',
@@ -111,6 +139,39 @@ function formStateFromReceiptResponse(receipt: ReceiptAPIResponse | Record<strin
   const extraction = (metaObj.extraction ?? null) as ReceiptExtractionFromAPI | null
   const ocr = (metaObj.ocr ?? (receipt as ReceiptAPIResponse).extracted_data ?? null) as ReceiptOcrFromAPI | null
   return mergeExtractionToFormState(extraction, ocr)
+}
+
+/** Build form state from POST /receipts/extract response (instant pipeline result). */
+function formStateFromExtractResponse(extract: ReceiptExtractAPIResponse): Partial<ExpenseFormState> {
+  const raw = extract.raw_extraction ?? {}
+  const str = (v: unknown, d = '') => (v != null && String(v).trim() !== '' ? String(v).trim() : d)
+  const num = (v: unknown) => (v != null && !Number.isNaN(Number(v)) ? String(v) : '')
+
+  let totalAmount = extract.total_amount ?? raw.total_amount
+  const fixedTotal = fixMisparsedAmount(totalAmount, true)
+  if (fixedTotal != null && totalAmount != null && fixedTotal !== Number(totalAmount)) {
+    totalAmount = fixedTotal
+  }
+
+  let vatAmount = extract.vat_amount ?? raw.vat_amount
+  const vatRateRaw = raw.vat_rate ?? extract.raw_extraction?.vat_rate
+  const fixedVat = fixMisparsedAmount(vatAmount, false)
+  if (fixedVat != null && vatAmount != null && fixedVat !== Number(vatAmount)) {
+    vatAmount = fixedVat
+  }
+  const vatNum = Number(vatAmount)
+  const rateCandidates = [5.5, 10, 20, 2.1, 8.5]
+  const likelyRate = vatNum > 0 && vatNum <= 100 && rateCandidates.includes(vatNum) && (vatRateRaw == null || vatRateRaw === '')
+
+  return {
+    merchant_name: str(extract.supplier ?? raw.merchant_name ?? raw.supplier, ''),
+    expense_date: toDateInputValue(extract.invoice_date ?? extract.raw_extraction?.expense_date ?? raw.invoice_date ?? raw.expense_date),
+    amount: totalAmount != null ? String(totalAmount) : '',
+    vat_amount: likelyRate ? '' : num(vatAmount),
+    vat_rate: num(likelyRate ? vatAmount : vatRateRaw),
+    currency: str(extract.currency ?? raw.currency, 'EUR') || 'EUR',
+    invoice_number: str(extract.invoice_number ?? raw.invoice_number, ''),
+  }
 }
 
 export default function NewExpensePage() {
@@ -257,7 +318,7 @@ export default function NewExpensePage() {
     }, 400)
 
     try {
-      // 1. Upload receipt (this triggers backend OCR pipeline)
+      // 1. Upload receipt (stores file and triggers backend pipeline)
       const uploadRes = await fileAPI.upload(file) as ReceiptAPIResponse & { receipt_id?: string; id?: string; data?: { receipt_id?: string; id?: string } }
       const rid =
         uploadRes.receipt_id ||
@@ -271,49 +332,91 @@ export default function NewExpensePage() {
 
       setReceiptId(rid)
 
-      // If upload response already has status === 'completed' and meta_data, pre-fill form once
+      // If upload response already has extraction/ocr, pre-fill once
       if (uploadRes.status === 'completed' && uploadRes.meta_data && (uploadRes.meta_data.extraction || uploadRes.meta_data.ocr)) {
         const merged = formStateFromReceiptResponse(uploadRes)
         setFormData((prev) => ({ ...prev, ...merged }))
       }
 
-      // 2. Poll OCR status
-      const maxAttempts = 20
-      let ocrCompleted = false
-      let ocrFailed = false
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const statusRes = await fileAPI.getReceiptStatus(rid) as { ocr_status?: string }
-        if (statusRes.ocr_status === 'completed') {
-          ocrCompleted = true
-          break
+      // 2. Call extract pipeline for instant pre-fill (OCR → classify → extract)
+      let extractUsed = false
+      try {
+        const extractRes = (await fileAPI.extract(file, 'fr')) as ReceiptExtractAPIResponse
+        const raw = extractRes?.raw_extraction ?? {}
+        const hasSupplier = Boolean((extractRes?.supplier ?? raw.merchant_name ?? raw.supplier) && String(extractRes?.supplier ?? raw.merchant_name ?? raw.supplier).trim())
+        const hasTotal = (extractRes?.total_amount ?? raw.total_amount) != null && Number(extractRes?.total_amount ?? raw.total_amount) > 0
+        const hasDate = Boolean((extractRes?.invoice_date ?? raw.expense_date ?? raw.invoice_date) && String(extractRes?.invoice_date ?? raw.expense_date ?? raw.invoice_date).trim())
+        if (extractRes && (hasSupplier || hasTotal || hasDate)) {
+          const merged = formStateFromExtractResponse(extractRes)
+          setFormData((prev) => ({ ...prev, ...merged }))
+          extractUsed = true
+          if (!merged.category && (merged.merchant_name || merged.description)) {
+            adminAPI.suggestCategory({
+              merchant_name: merged.merchant_name || null,
+              description: merged.description || null,
+              amount: merged.amount ? parseFloat(merged.amount) : null,
+            }).then((res) => {
+              if (res.suggested_category) {
+                setFormData((prev) => ({ ...prev, category: res.suggested_category!.name }))
+                setSuggestionReasoning(res.reasoning ?? null)
+              }
+            }).catch(() => {})
+          }
         }
-        if (statusRes.ocr_status === 'failed') {
-          ocrFailed = true
+      } catch (_) {
+        // Extract failed: fall back to polling receipt
+      }
+
+      if (!extractUsed) {
+        // 3. Fallback: poll OCR status then load receipt
+        const maxAttempts = 20
+        let ocrCompleted = false
+        let ocrFailed = false
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          const statusRes = await fileAPI.getReceiptStatus(rid) as { ocr_status?: string }
+          if (statusRes.ocr_status === 'completed') {
+            ocrCompleted = true
+            break
+          }
+          if (statusRes.ocr_status === 'failed') {
+            ocrFailed = true
+            setOcrWarning(
+              'OCR could not read this receipt (e.g. Tesseract is not installed or not in your PATH). You can still enter the details manually below.'
+            )
+            break
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1000))
+        }
+
+        if (!ocrCompleted && !ocrFailed) {
+          throw new Error('OCR is taking longer than expected. Please try again in a moment.')
+        }
+
+        // Pipeline may write extraction shortly after ocr_status=completed; retry getReceipt until we have data
+        let receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
+        const meta = receipt?.meta_data ?? {}
+        const hasExtraction = meta && typeof meta === 'object' && (!!(meta as Record<string, unknown>).extraction || !!(meta as Record<string, unknown>).ocr)
+        if (!hasExtraction) {
+          for (let retry = 0; retry < 5; retry++) {
+            await new Promise((r) => setTimeout(r, 1500))
+            receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
+            const m = receipt?.meta_data ?? {}
+            if (m && typeof m === 'object' && (!!(m as Record<string, unknown>).extraction || !!(m as Record<string, unknown>).ocr)) {
+              break
+            }
+          }
+        }
+        const merged = formStateFromReceiptResponse(receipt)
+        setFormData((prev) => ({ ...prev, ...merged }))
+
+        const pipelineError = receipt.meta_data?.pipeline_error
+        if (pipelineError && !ocrWarning) {
           setOcrWarning(
-            'OCR could not read this receipt (e.g. Tesseract is not installed or not in your PATH). You can still enter the details manually below.'
+            pipelineError.includes('tesseract') || pipelineError.toLowerCase().includes('path')
+              ? 'OCR failed: Tesseract is not installed or not in your PATH. Extracted data may be incomplete.'
+              : `OCR warning: ${pipelineError}`
           )
-          break
         }
-        await new Promise((resolve) => setTimeout(resolve, 1000))
-      }
-
-      if (!ocrCompleted && !ocrFailed) {
-        throw new Error('OCR is taking longer than expected. Please try again in a moment.')
-      }
-
-      // 3. Load full receipt and populate form from meta_data.extraction + meta_data.ocr (with fallback)
-      const receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
-      const merged = formStateFromReceiptResponse(receipt)
-      setFormData((prev) => ({ ...prev, ...merged }))
-
-      // Show OCR warning if backend reported a pipeline/OCR error
-      const pipelineError = receipt.meta_data?.pipeline_error
-      if (pipelineError && !ocrWarning) {
-        setOcrWarning(
-          pipelineError.includes('tesseract') || pipelineError.toLowerCase().includes('path')
-            ? 'OCR failed: Tesseract is not installed or not in your PATH. Extracted data may be incomplete.'
-            : `OCR warning: ${pipelineError}`
-        )
       }
 
       clearInterval(interval)
@@ -605,35 +708,43 @@ export default function NewExpensePage() {
                     <FontAwesomeIcon icon={faCheck} className="text-white text-xl" />
                   </div>
                   <div className="flex-1">
-                    <h3 className="text-lg font-semibold text-textPrimary mb-2">Data Extracted Successfully</h3>
+                    <h3 className="text-lg font-semibold text-textPrimary mb-2">
+                      {(formData.merchant_name && formData.merchant_name.trim()) || (formData.amount && Number(formData.amount) > 0) || (formData.expense_date && formData.expense_date.trim())
+                        ? 'Data Extracted Successfully'
+                        : 'Receipt Uploaded'}
+                    </h3>
                     <p className="text-sm text-textSecondary mb-4">
-                      AI has extracted the following information from your receipt. Please review and confirm.
+                      {(formData.merchant_name && formData.merchant_name.trim()) || (formData.amount && Number(formData.amount) > 0) || (formData.expense_date && formData.expense_date.trim())
+                        ? 'AI has extracted the following information from your receipt. Please review and confirm.'
+                        : 'Extraction is still processing or the receipt could not be read automatically. You can enter the details manually below.'}
                     </p>
                     <div className="grid grid-cols-2 gap-3">
                       <div className="bg-white rounded-lg p-3 border border-green-200">
                         <div className="text-xs text-textMuted mb-1">Merchant</div>
                         <div className="text-sm font-medium text-textPrimary">
-                          {formData.merchant_name || 'Detected merchant name'}
+                          {formData.merchant_name || '—'}
                         </div>
                       </div>
                       <div className="bg-white rounded-lg p-3 border border-green-200">
                         <div className="text-xs text-textMuted mb-1">Date</div>
                         <div className="text-sm font-medium text-textPrimary">
-                          {formData.expense_date || 'Detected date'}
+                          {formData.expense_date || '—'}
                         </div>
                       </div>
                       <div className="bg-white rounded-lg p-3 border border-green-200">
                         <div className="text-xs text-textMuted mb-1">Total Amount</div>
                         <div className="text-sm font-medium text-textPrimary">
-                          {formData.amount ? `€${formData.amount}` : '—'}
+                          {formData.amount && Number(formData.amount) > 0 ? `€${formData.amount}` : '—'}
                         </div>
                       </div>
                       <div className="bg-white rounded-lg p-3 border border-green-200">
                         <div className="text-xs text-textMuted mb-1">VAT Amount</div>
                         <div className="text-sm font-medium text-textPrimary">
-                          {formData.vat_amount
+                          {formData.vat_amount && Number(formData.vat_amount) > 0
                             ? `€${formData.vat_amount}${formData.vat_rate ? ` (${formData.vat_rate}%)` : ''}`
-                            : 'Detected VAT'}
+                            : formData.vat_rate && Number(formData.vat_rate) > 0
+                              ? `${formData.vat_rate}%`
+                              : '—'}
                         </div>
                       </div>
                       {formData.invoice_number && (

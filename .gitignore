@@ -26,7 +26,7 @@ Thumbs.db
 *.swp
 *.swo
 
-# Environment files (keep examples)
+# Environment files (keep examples only)
 .env
 .env.*
 !.env.example
@@ -40,4 +40,6 @@ coverage/
 
 # Misc
 *.tsbuildinfo
+.vercel
+.pnpm-store/
 

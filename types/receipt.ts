@@ -55,6 +55,31 @@ export type ReceiptOcrFromAPI = {
   [key: string]: unknown
 }
 
+/** Response from POST /api/v1/receipts/extract (full pipeline: OCR → classify → extract) */
+export type ReceiptExtractAPIResponse = {
+  document_type?: string
+  ocr_text?: string
+  ocr_confidence?: number | null
+  raw_extraction?: {
+    supplier?: string | null
+    merchant_name?: string | null
+    invoice_number?: string | null
+    invoice_date?: string | null
+    expense_date?: string | null
+    vat_amount?: number | null
+    total_amount?: number | null
+    currency?: string | null
+    vat_rate?: number | null
+    [key: string]: unknown
+  }
+  supplier?: string | null
+  invoice_number?: string | null
+  invoice_date?: string | null
+  vat_amount?: number | null
+  total_amount?: number | null
+  currency?: string | null
+}
+
 /** Receipt API response (GET /receipts/:id or upload response with meta_data) */
 export type ReceiptAPIResponse = {
   receipt_id?: string
