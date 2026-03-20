@@ -41,7 +41,7 @@ type ToastType = 'error' | 'success';
 export default function ReportDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
-  const { isAuthenticated, loading: authLoading, user } = useAuth();
+  const { isAuthenticated, loading: authLoading } = useAuth();
 
   const [report, setReport] = useState<ExpenseReport | null>(null);
   const [expenses, setExpenses] = useState<ReportExpenseItem[]>([]);
@@ -57,7 +57,8 @@ export default function ReportDetailPage() {
   const [toast, setToast] = useState<{ message: string; type: ToastType } | null>(null);
 
   // ✅ FIX: roles is an array
-  const isManager = user?.roles?.includes('manager');
+  // Backend-first: approval permissions are enforced by the backend.
+  // We only show the controls when the report is pending in workflow.
 
   const showToast = (message: string, type: ToastType = 'error') => {
     setToast({ message, type });
@@ -315,7 +316,7 @@ export default function ReportDetailPage() {
             </>
           )}
 
-          {report.status === 'submitted' && isManager && (
+          {report.status === 'submitted' && (
             <>
               <button onClick={handleApprove} className="px-4 py-2 bg-green-600 text-white rounded-md">
                 Approve

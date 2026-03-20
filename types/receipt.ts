@@ -21,6 +21,7 @@ export type ReceiptData = {
 
 /** Backend returns snake_case (merchant_name, expense_date, etc.) */
 export type ReceiptExtractionFromAPI = {
+  document_type?: string | null
   merchant_name?: string | null
   merchant_address?: string | null
   expense_date?: string | null
@@ -33,6 +34,14 @@ export type ReceiptExtractionFromAPI = {
   payment_method?: string | null
   description?: string | null
   category?: string | null
+  others?: string[] | null
+  status?: string | null
+  overall_confidence?: number | null
+  confidence_scores?: Record<string, number> | null
+  field_sources?: Record<string, string> | null
+  field_reasoning?: Record<string, string> | null
+  bank_statement?: Record<string, unknown> | null
+  payslip?: Record<string, unknown> | null
   line_items?: Array<{
     description?: string
     name?: string

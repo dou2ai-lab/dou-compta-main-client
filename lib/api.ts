@@ -288,34 +288,13 @@ export const fileAPI = {
     const res = await fileClient.delete(`/api/v1/receipts/${receiptId}`);
     return res.data;
   },
-
-  /**
-   * Full pipeline: OCR → document classification → field extraction.
-   * Returns { document_type, ocr_text, supplier, invoice_number, invoice_date, vat_amount, total_amount, currency, raw_extraction }.
-   * Use to pre-fill expense form without waiting for upload pipeline.
-   */
-  extract: async (file: File, language = 'fr') => {
-    const form = new FormData();
-    form.append('file', file);
-    form.append('language', language);
-
+  submitCorrections: async (receiptId: string, payload: { corrected_values: Record<string, unknown>; predicted_extraction?: Record<string, unknown> | null }) => {
+    // In browser, use Next.js proxy to avoid CORS
     if (typeof window !== 'undefined') {
-      const token = getAuthToken();
-      const axiosRes = await axios.post('/api/file/extract', form, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-        timeout: 60000,
-      });
+      const axiosRes = await axios.post(`/api/receipts/${receiptId}/corrections`, payload);
       return axiosRes.data;
     }
-
-    const res = await fileClient.post('/api/v1/receipts/extract', form, {
-      headers: { 'Content-Type': 'multipart/form-data' },
-      params: { language },
-      timeout: 60000,
-    });
+    const res = await fileClient.post(`/api/v1/receipts/${receiptId}/corrections`, payload);
     return res.data;
   },
 };

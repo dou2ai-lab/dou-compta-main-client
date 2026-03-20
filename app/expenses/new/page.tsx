@@ -21,7 +21,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons'
 import { fileAPI, expensesAPI, reportAPI, adminAPI, getAuthErrorMessage } from '@/lib/api'
 import type { AdminCategory } from '@/lib/api'
-import type { ReceiptAPIResponse, ReceiptExtractionFromAPI, ReceiptOcrFromAPI, ReceiptExtractAPIResponse } from '@/types/receipt'
+import type { ReceiptAPIResponse, ReceiptExtractionFromAPI, ReceiptOcrFromAPI } from '@/types/receipt'
 
 type UploadState = 'empty' | 'processing' | 'success'
 
@@ -141,39 +141,6 @@ function formStateFromReceiptResponse(receipt: ReceiptAPIResponse | Record<strin
   return mergeExtractionToFormState(extraction, ocr)
 }
 
-/** Build form state from POST /receipts/extract response (instant pipeline result). */
-function formStateFromExtractResponse(extract: ReceiptExtractAPIResponse): Partial<ExpenseFormState> {
-  const raw = extract.raw_extraction ?? {}
-  const str = (v: unknown, d = '') => (v != null && String(v).trim() !== '' ? String(v).trim() : d)
-  const num = (v: unknown) => (v != null && !Number.isNaN(Number(v)) ? String(v) : '')
-
-  let totalAmount = extract.total_amount ?? raw.total_amount
-  const fixedTotal = fixMisparsedAmount(totalAmount, true)
-  if (fixedTotal != null && totalAmount != null && fixedTotal !== Number(totalAmount)) {
-    totalAmount = fixedTotal
-  }
-
-  let vatAmount = extract.vat_amount ?? raw.vat_amount
-  const vatRateRaw = raw.vat_rate ?? extract.raw_extraction?.vat_rate
-  const fixedVat = fixMisparsedAmount(vatAmount, false)
-  if (fixedVat != null && vatAmount != null && fixedVat !== Number(vatAmount)) {
-    vatAmount = fixedVat
-  }
-  const vatNum = Number(vatAmount)
-  const rateCandidates = [5.5, 10, 20, 2.1, 8.5]
-  const likelyRate = vatNum > 0 && vatNum <= 100 && rateCandidates.includes(vatNum) && (vatRateRaw == null || vatRateRaw === '')
-
-  return {
-    merchant_name: str(extract.supplier ?? raw.merchant_name ?? raw.supplier, ''),
-    expense_date: toDateInputValue(extract.invoice_date ?? extract.raw_extraction?.expense_date ?? raw.invoice_date ?? raw.expense_date),
-    amount: totalAmount != null ? String(totalAmount) : '',
-    vat_amount: likelyRate ? '' : num(vatAmount),
-    vat_rate: num(likelyRate ? vatAmount : vatRateRaw),
-    currency: str(extract.currency ?? raw.currency, 'EUR') || 'EUR',
-    invoice_number: str(extract.invoice_number ?? raw.invoice_number, ''),
-  }
-}
-
 export default function NewExpensePage() {
   const router = useRouter()
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -199,6 +166,14 @@ export default function NewExpensePage() {
     description: '',
     currency: 'EUR',
   })
+  const [extractionMeta, setExtractionMeta] = useState<{
+    status?: string | null
+    confidence_scores?: Record<string, number> | null
+    overall_confidence?: number | null
+    others?: string[] | null
+    document_type?: string | null
+  } | null>(null)
+  const [predictedExtraction, setPredictedExtraction] = useState<ReceiptExtractionFromAPI | null>(null)
 
   // Load categories for dropdown (tenant categories; used for suggestion and list)
   useEffect(() => {
@@ -225,6 +200,16 @@ export default function NewExpensePage() {
         if (meta && typeof meta === 'object' && ((meta as Record<string, unknown>).extraction || (meta as Record<string, unknown>).ocr)) {
           const merged = formStateFromReceiptResponse(raw)
           setFormData((prev) => ({ ...prev, ...merged }))
+          const m = meta as { extraction?: ReceiptExtractionFromAPI | null }
+          const ex = m.extraction ?? null
+          setExtractionMeta(ex ? {
+            status: ex.status ?? null,
+            confidence_scores: ex.confidence_scores ?? null,
+            overall_confidence: ex.overall_confidence ?? null,
+            others: ex.others ?? null,
+            document_type: ex.document_type ?? null,
+          } : null)
+          setPredictedExtraction(ex ?? null)
           if (!merged.category && (merged.merchant_name || merged.description)) {
             adminAPI.suggestCategory({
               merchant_name: merged.merchant_name || null,
@@ -242,6 +227,19 @@ export default function NewExpensePage() {
       .catch(() => { /* ignore - we already populated in handleFileUpload */ })
     return () => { cancelled = true }
   }, [uploadState, receiptId])
+
+  const fieldConfidence = (field: string): number | null => {
+    const cs = extractionMeta?.confidence_scores
+    if (!cs) return null
+    const v = cs[field]
+    return typeof v === 'number' ? v : null
+  }
+
+  const inputClass = (field: string, base: string): string => {
+    const c = fieldConfidence(field)
+    const isLow = c != null && c < 0.97
+    return `${base}${isLow ? ' border-warningOrange ring-1 ring-warningOrange/40' : ''}`
+  }
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault()
@@ -338,85 +336,54 @@ export default function NewExpensePage() {
         setFormData((prev) => ({ ...prev, ...merged }))
       }
 
-      // 2. Call extract pipeline for instant pre-fill (OCR → classify → extract)
-      let extractUsed = false
-      try {
-        const extractRes = (await fileAPI.extract(file, 'fr')) as ReceiptExtractAPIResponse
-        const raw = extractRes?.raw_extraction ?? {}
-        const hasSupplier = Boolean((extractRes?.supplier ?? raw.merchant_name ?? raw.supplier) && String(extractRes?.supplier ?? raw.merchant_name ?? raw.supplier).trim())
-        const hasTotal = (extractRes?.total_amount ?? raw.total_amount) != null && Number(extractRes?.total_amount ?? raw.total_amount) > 0
-        const hasDate = Boolean((extractRes?.invoice_date ?? raw.expense_date ?? raw.invoice_date) && String(extractRes?.invoice_date ?? raw.expense_date ?? raw.invoice_date).trim())
-        if (extractRes && (hasSupplier || hasTotal || hasDate)) {
-          const merged = formStateFromExtractResponse(extractRes)
-          setFormData((prev) => ({ ...prev, ...merged }))
-          extractUsed = true
-          if (!merged.category && (merged.merchant_name || merged.description)) {
-            adminAPI.suggestCategory({
-              merchant_name: merged.merchant_name || null,
-              description: merged.description || null,
-              amount: merged.amount ? parseFloat(merged.amount) : null,
-            }).then((res) => {
-              if (res.suggested_category) {
-                setFormData((prev) => ({ ...prev, category: res.suggested_category!.name }))
-                setSuggestionReasoning(res.reasoning ?? null)
-              }
-            }).catch(() => {})
-          }
+      // 2. Poll OCR status then load receipt (OCR + extraction happen during upload)
+      const maxAttempts = 20
+      let ocrCompleted = false
+      let ocrFailed = false
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const statusRes = await fileAPI.getReceiptStatus(rid) as { ocr_status?: string }
+        if (statusRes.ocr_status === 'completed') {
+          ocrCompleted = true
+          break
         }
-      } catch (_) {
-        // Extract failed: fall back to polling receipt
+        if (statusRes.ocr_status === 'failed') {
+          ocrFailed = true
+          setOcrWarning(
+            'OCR could not read this receipt (e.g. Tesseract is not installed or not in your PATH). You can still enter the details manually below.'
+          )
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000))
       }
 
-      if (!extractUsed) {
-        // 3. Fallback: poll OCR status then load receipt
-        const maxAttempts = 20
-        let ocrCompleted = false
-        let ocrFailed = false
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-          const statusRes = await fileAPI.getReceiptStatus(rid) as { ocr_status?: string }
-          if (statusRes.ocr_status === 'completed') {
-            ocrCompleted = true
+      if (!ocrCompleted && !ocrFailed) {
+        throw new Error('OCR is taking longer than expected. Please try again in a moment.')
+      }
+
+      // Pipeline may write extraction shortly after ocr_status=completed; retry getReceipt until we have data
+      let receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
+      const meta = receipt?.meta_data ?? {}
+      const hasExtraction = meta && typeof meta === 'object' && (!!(meta as Record<string, unknown>).extraction || !!(meta as Record<string, unknown>).ocr)
+      if (!hasExtraction) {
+        for (let retry = 0; retry < 5; retry++) {
+          await new Promise((r) => setTimeout(r, 1500))
+          receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
+          const m = receipt?.meta_data ?? {}
+          if (m && typeof m === 'object' && (!!(m as Record<string, unknown>).extraction || !!(m as Record<string, unknown>).ocr)) {
             break
           }
-          if (statusRes.ocr_status === 'failed') {
-            ocrFailed = true
-            setOcrWarning(
-              'OCR could not read this receipt (e.g. Tesseract is not installed or not in your PATH). You can still enter the details manually below.'
-            )
-            break
-          }
-          await new Promise((resolve) => setTimeout(resolve, 1000))
         }
+      }
+      const merged = formStateFromReceiptResponse(receipt)
+      setFormData((prev) => ({ ...prev, ...merged }))
 
-        if (!ocrCompleted && !ocrFailed) {
-          throw new Error('OCR is taking longer than expected. Please try again in a moment.')
-        }
-
-        // Pipeline may write extraction shortly after ocr_status=completed; retry getReceipt until we have data
-        let receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
-        const meta = receipt?.meta_data ?? {}
-        const hasExtraction = meta && typeof meta === 'object' && (!!(meta as Record<string, unknown>).extraction || !!(meta as Record<string, unknown>).ocr)
-        if (!hasExtraction) {
-          for (let retry = 0; retry < 5; retry++) {
-            await new Promise((r) => setTimeout(r, 1500))
-            receipt = (await fileAPI.getReceipt(rid)) as ReceiptAPIResponse
-            const m = receipt?.meta_data ?? {}
-            if (m && typeof m === 'object' && (!!(m as Record<string, unknown>).extraction || !!(m as Record<string, unknown>).ocr)) {
-              break
-            }
-          }
-        }
-        const merged = formStateFromReceiptResponse(receipt)
-        setFormData((prev) => ({ ...prev, ...merged }))
-
-        const pipelineError = receipt.meta_data?.pipeline_error
-        if (pipelineError && !ocrWarning) {
-          setOcrWarning(
-            pipelineError.includes('tesseract') || pipelineError.toLowerCase().includes('path')
-              ? 'OCR failed: Tesseract is not installed or not in your PATH. Extracted data may be incomplete.'
-              : `OCR warning: ${pipelineError}`
-          )
-        }
+      const pipelineError = receipt.meta_data?.pipeline_error
+      if (pipelineError && !ocrWarning) {
+        setOcrWarning(
+          pipelineError.includes('tesseract') || pipelineError.toLowerCase().includes('path')
+            ? 'OCR failed: Tesseract is not installed or not in your PATH. Extracted data may be incomplete.'
+            : `OCR warning: ${pipelineError}`
+        )
       }
 
       clearInterval(interval)
@@ -504,6 +471,33 @@ export default function NewExpensePage() {
     return payload
   }
 
+  const submitCorrectionsIfAny = async () => {
+    if (!receiptId) return
+    // Map current form values to backend extraction field names
+    const corrected_values: Record<string, unknown> = {
+      merchant_name: formData.merchant_name || null,
+      expense_date: formData.expense_date || null,
+      total_amount: formData.amount ? parseFloat(formData.amount) : null,
+      vat_amount: formData.vat_amount ? parseFloat(formData.vat_amount) : null,
+      vat_rate: formData.vat_rate ? parseFloat(formData.vat_rate) : null,
+      currency: formData.currency || 'EUR',
+      invoice_number: formData.invoice_number || null,
+      payment_method: formData.payment_method || null,
+      merchant_address: formData.merchant_address || null,
+      merchant_vat_number: formData.merchant_vat_number || null,
+      description: formData.description || null,
+      category: formData.category || null,
+    }
+    try {
+      await fileAPI.submitCorrections(receiptId, {
+        corrected_values,
+        predicted_extraction: predictedExtraction ?? null,
+      })
+    } catch {
+      // Best-effort: do not block saving expense if feedback logging fails
+    }
+  }
+
   const handleSaveDraft = async () => {
     if (!formData.merchant_name || !formData.expense_date || !formData.amount) {
       setError('Please fill in merchant, date, and total amount before saving.')
@@ -512,6 +506,7 @@ export default function NewExpensePage() {
     setSaving(true)
     setError('')
     try {
+      await submitCorrectionsIfAny()
       await expensesAPI.create(buildPayload())
       router.push('/expenses')
     } catch (err: any) {
@@ -531,6 +526,7 @@ export default function NewExpensePage() {
     setError('')
 
     try {
+      await submitCorrectionsIfAny()
       const created = await expensesAPI.create(buildPayload())
       const expenseId = created?.data?.id ?? created?.id
       if (!expenseId) {
@@ -579,6 +575,7 @@ export default function NewExpensePage() {
     setError('')
 
     try {
+      await submitCorrectionsIfAny()
       const created = await expensesAPI.create(buildPayload())
       const expenseId = created?.data?.id ?? created?.id
       if (expenseId) {
@@ -844,6 +841,31 @@ export default function NewExpensePage() {
             </div>
 
             <div className="space-y-6">
+              {(extractionMeta?.status === 'needs_review' || extractionMeta?.status === 'REQUIRES_MANUAL_VALIDATION') && (
+                <div className={`rounded-lg border px-4 py-3 text-sm ${
+                  extractionMeta.status === 'REQUIRES_MANUAL_VALIDATION'
+                    ? 'border-errorRed/40 bg-errorRed/10 text-errorRed'
+                    : 'border-warningOrange/40 bg-warningOrange/10 text-warningOrange'
+                }`}>
+                  {extractionMeta.status === 'REQUIRES_MANUAL_VALIDATION'
+                    ? 'Some critical fields are missing. Please correct the highlighted fields before saving.'
+                    : 'Some fields have low confidence. Please review the highlighted fields.'}
+                </div>
+              )}
+              {(extractionMeta?.document_type || typeof extractionMeta?.overall_confidence === 'number') && (
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {extractionMeta.document_type && (
+                    <span className="px-2 py-1 rounded-full border border-borderColor bg-white text-textSecondary">
+                      Type: {extractionMeta.document_type}
+                    </span>
+                  )}
+                  {typeof extractionMeta.overall_confidence === 'number' && (
+                    <span className="px-2 py-1 rounded-full border border-borderColor bg-white text-textSecondary">
+                      Confidence: {Math.round(extractionMeta.overall_confidence * 100)}%
+                    </span>
+                  )}
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-6">
                 <div>
                   <label className="block text-sm font-medium text-textPrimary mb-2">
@@ -854,7 +876,7 @@ export default function NewExpensePage() {
                       type="text"
                       value={formData.merchant_name}
                       onChange={(e) => setFormData({ ...formData, merchant_name: e.target.value })}
-                      className="w-full h-10 px-3 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                      className={inputClass('merchant_name', 'w-full h-10 px-3 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent')}
                     />
                     <span className="absolute right-3 top-1/2 transform -translate-y-1/2 text-xs font-medium text-primary bg-indigo-50 px-2 py-1 rounded-full flex items-center space-x-1">
                       <FontAwesomeIcon icon={faRobot} className="text-xs" />
@@ -872,7 +894,7 @@ export default function NewExpensePage() {
                       type="date"
                       value={formData.expense_date}
                       onChange={(e) => setFormData({ ...formData, expense_date: e.target.value })}
-                      className="w-full h-10 px-3 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                      className={inputClass('expense_date', 'w-full h-10 px-3 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent')}
                     />
                     <span className="absolute right-3 top-1/2 transform -translate-y-1/2 text-xs font-medium text-primary bg-indigo-50 px-2 py-1 rounded-full flex items-center space-x-1">
                       <FontAwesomeIcon icon={faRobot} className="text-xs" />
@@ -894,7 +916,7 @@ export default function NewExpensePage() {
                       value={formData.amount}
                       onChange={(e) => setFormData({ ...formData, amount: e.target.value })}
                       step="0.01"
-                      className="w-full h-10 pl-8 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                      className={inputClass('total_amount', 'w-full h-10 pl-8 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent')}
                     />
                     <span className="absolute right-3 top-1/2 transform -translate-y-1/2 text-xs font-medium text-primary bg-indigo-50 px-2 py-1 rounded-full flex items-center space-x-1">
                       <FontAwesomeIcon icon={faRobot} className="text-xs" />
@@ -912,7 +934,7 @@ export default function NewExpensePage() {
                       value={formData.vat_amount}
                       onChange={(e) => setFormData({ ...formData, vat_amount: e.target.value })}
                       step="0.01"
-                      className="w-full h-10 pl-8 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                      className={inputClass('vat_amount', 'w-full h-10 pl-8 pr-20 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent')}
                     />
                     <span className="absolute right-3 top-1/2 transform -translate-y-1/2 text-xs font-medium text-primary bg-indigo-50 px-2 py-1 rounded-full flex items-center space-x-1">
                       <FontAwesomeIcon icon={faRobot} className="text-xs" />
@@ -928,7 +950,7 @@ export default function NewExpensePage() {
                     VAT Rate <span className="text-errorRed">*</span>
                   </label>
                   <select
-                    className="w-full h-10 px-3 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+                    className={inputClass('vat_rate', 'w-full h-10 px-3 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent')}
                     value={formData.vat_rate || ''}
                     onChange={(e) => setFormData({ ...formData, vat_rate: e.target.value })}
                   >
@@ -998,6 +1020,17 @@ export default function NewExpensePage() {
                   className="w-full px-3 py-2 border border-borderColor rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent resize-none"
                 />
               </div>
+
+              {Array.isArray(extractionMeta?.others) && extractionMeta!.others!.length > 0 && (
+                <div className="rounded-lg border border-borderColor bg-white p-4">
+                  <div className="text-sm font-medium text-textPrimary mb-2">Other extracted insights</div>
+                  <ul className="list-disc pl-5 text-sm text-textSecondary space-y-1">
+                    {extractionMeta!.others!.filter(Boolean).slice(0, 5).map((o, idx) => (
+                      <li key={`${idx}-${String(o)}`}>{String(o)}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-6">
                 <div>
