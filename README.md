@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Dou Compta — Web Client
 
 Next.js frontend for **Dou Expense & Audit AI**: expense management, receipt upload, and AI-powered extraction (OCR + document classification + field extraction).
@@ -73,3 +74,7 @@ App runs at [http://localhost:3000](http://localhost:3000).
 - `app/expenses/new/` — New expense page with receipt upload and extract
 - `lib/` — API client (`api.ts`), auth, utils
 - `types/` — TypeScript types (e.g. receipt extract response)
+=======
+# dou-compta-main-client
+Frontend application for DouCompta, covering dashboards, accounting, banking, tax, invoices, dossiers, approvals, and user workflows.
+>>>>>>> 275123909615a1c6608ef64b696f9374a9a95d42
